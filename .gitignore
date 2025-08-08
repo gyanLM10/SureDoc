@@ -1,0 +1,4 @@
+venv
+.env
+doctor_appointment_agentic.egg-info
+Miniconda3-latest-MacOSX-arm64.sh
