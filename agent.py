@@ -1,147 +1,171 @@
-from typing import Literal, List, Any
-from langchain_core.tools import tool
-from langgraph.types import Command
-from langgraph.graph.message import add_messages
+from typing import Literal, Any
 from typing_extensions import TypedDict, Annotated
+from langchain.output_parsers import PydanticOutputParser
 from langchain_core.prompts.chat import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain.schema import OutputParserException
+from langgraph.graph.message import add_messages
+from langgraph.types import Command
 from langgraph.graph import START, StateGraph, END
+from pydantic import BaseModel
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage, AIMessage
 from prompt_library.prompt import system_prompt
 from utils.llms import LLMModel
-from Toolkit.toolkits import *
+from Toolkit.toolkits import (
+    check_availability_by_doctor,
+    check_availability_by_specialization,
+    set_appointment,
+    cancel_appointment,
+    reschedule_appointment
+)
 
-
-class Router(TypedDict):
-    next: Literal["information_node", "booking_node", "FINISH"]
+# ======== Schema for Supervisor Routing ========
+class Router(BaseModel):
+    next: Literal['information_node', 'booking_node', 'FINISH']
     reasoning: str
 
-
+# ======== Shared State Across Nodes ========
 class AgentState(TypedDict):
     messages: Annotated[list[Any], add_messages]
     id_number: int
     next: str
     query: str
     current_reasoning: str
+    step_count: int  # NEW: loop safety counter
 
-
+# ======== Main Agent ========
 class DoctorAppointmentAgent:
     def __init__(self):
         llm_model = LLMModel()
-        self.llm_model = llm_model.get_model()
+        self.model = llm_model.get_model()
+        self.parser = PydanticOutputParser(pydantic_object=Router)
 
     def supervisor_node(self, state: AgentState) -> Command[Literal['information_node', 'booking_node', '__end__']]:
-        print("**************************below is my state right after entering****************************")
-        print(state)
+        print("\n[Supervisor] State:", state)
+
+        # Stop if loop count exceeds threshold
+        step_count = state.get("step_count", 0) + 1
+        if step_count > 6:  # limit to avoid infinite recursion
+            print("[Supervisor] Step limit reached — ending conversation.")
+            return Command(goto=END, update={"step_count": step_count})
+
+        # Strict routing instructions
+        system_instructions = f"""
+        You are a strict JSON generator for routing requests.
+        Always respond ONLY with a JSON object that matches this schema:
+        {self.parser.get_format_instructions()}
+        """
 
         messages = [
-                       {"role": "system", "content": system_prompt},
-                       {"role": "user", "content": f"user's identification number is {state['id_number']}"},
-                   ] + state["messages"]
+            SystemMessage(content=system_instructions),
+            HumanMessage(content=f"user's identification number is {state['id_number']}")
+        ] + state["messages"]
 
-        print("***********************this is my message*****************************************")
-        print(messages)
+        query = state['messages'][0].content if len(state['messages']) == 1 else ""
 
-        # query = state['messages'][-1].content if state["messages"] else ""
-        query = ''
-        if len(state['messages']) == 1:
-            query = state['messages'][0].content
+        raw_response = self.model.invoke(messages)
+        print("[Supervisor] Raw output:", raw_response)
 
-        print("************below is my query********************")
-        print(query)
+        try:
+            response = self.parser.parse(raw_response.content)
+        except OutputParserException as e:
+            print("[Supervisor] Parsing failed:", e)
+            # End instead of infinite loop on repeated parse failures
+            return Command(goto=END, update={"step_count": step_count})
 
-        response = self.llm_model.with_structured_output(Router).invoke(messages)
-
-        goto = response["next"]
-
-        print("********************************this is my goto*************************")
-        print(goto)
-
-        print("********************************")
-        print(response["reasoning"])
-
+        goto = response.next
         if goto == "FINISH":
             goto = END
 
-        print("**************************below is my state****************************")
-        print(state)
+        update_data = {
+            'next': goto,
+            'current_reasoning': response.reasoning,
+            'step_count': step_count
+        }
 
         if query:
-            return Command(goto=goto, update={'next': goto,
-                                              'query': query,
-                                              'current_reasoning': response["reasoning"],
-                                              'messages': [HumanMessage(
-                                                  content=f"user's identification number is {state['id_number']}")]
-                                              })
-        return Command(goto=goto, update={'next': goto,
-                                          'current_reasoning': response["reasoning"]}
-                       )
-
-    def information_node(self, state: AgentState) -> Command[Literal['supervisor']]:
-        print("*****************called information node************")
-
-        system_prompt = "You are specialized agent to provide information related to availability of doctors or any FAQs related to hospital based on the query. You have access to the tool.\n Make sure to ask user politely if you need any further information to execute the tool.\n For your information, Always consider current year is 2024."
-
-        system_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    system_prompt
-                ),
-                (
-                    "placeholder",
-                    "{messages}"
-                ),
+            update_data['query'] = query
+            update_data['messages'] = [
+                HumanMessage(content=f"user's identification number is {state['id_number']}")
             ]
+
+        return Command(goto=goto, update=update_data)
+
+    def information_node(self, state: AgentState) -> Command:
+        print("[Information Node] Running")
+
+        system_prompt_text = (
+            "You are a specialized hospital information agent. "
+            "You can provide details about doctor availability or answer FAQs about the hospital. "
+            "Ask for missing details politely. Assume the year is 2024."
         )
 
-        information_agent = create_react_agent(model=self.llm_model, tools=[check_availability_by_doctor,
-                                                                            check_availability_by_specialization],
-                                               prompt=system_prompt)
+        system_prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt_text),
+            ("placeholder", "{messages}"),
+        ])
 
-        result = information_agent.invoke(state)
+        messages = [
+            HumanMessage(content=f"user's identification number is {state['id_number']}")
+        ] + state["messages"]
+
+        information_agent = create_react_agent(
+            model=self.model,
+            tools=[check_availability_by_doctor, check_availability_by_specialization],
+            prompt=system_prompt
+        )
+
+        result = information_agent.invoke({"messages": messages})
+        last_message_content = (
+            result["messages"][-1].content
+            if "messages" in result else result.get("output", "")
+        )
+
+        # Example: End if no further question is needed
+        if "anything else" not in last_message_content.lower():
+            return Command(
+                update={"messages": state["messages"] + [AIMessage(content=last_message_content, name="information_node")]},
+                goto=END
+            )
 
         return Command(
-            update={
-                "messages": state["messages"] + [
-                    AIMessage(content=result["messages"][-1].content, name="information_node")
-                    # HumanMessage(content=result["messages"][-1].content, name="information_node")
-                ]
-            },
-            goto="supervisor",
+            update={"messages": state["messages"] + [AIMessage(content=last_message_content, name="information_node")]},
+            goto="supervisor"
         )
 
-    def booking_node(self, state: AgentState) -> Command[Literal['supervisor']]:
-        print("*****************called booking node************")
+    def booking_node(self, state: AgentState) -> Command:
+        print("[Booking Node] Running")
 
-        system_prompt = "You are specialized agent to set, cancel or reschedule appointment based on the query. You have access to the tool.\n Make sure to ask user politely if you need any further information to execute the tool.\n For your information, Always consider current year is 2024."
+        system_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a specialized agent to set, cancel, or reschedule an appointment. "
+             "Ask politely for missing details. Assume the year is 2024."),
+            ("placeholder", "{messages}")
+        ])
 
-        system_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    system_prompt
-                ),
-                (
-                    "placeholder",
-                    "{messages}"
-                ),
-            ]
+        booking_agent = create_react_agent(
+            model=self.model,
+            tools=[set_appointment, cancel_appointment, reschedule_appointment],
+            prompt=system_prompt
         )
-        booking_agent = create_react_agent(model=self.llm_model,
-                                           tools=[set_appointment, cancel_appointment, reschedule_appointment],
-                                           prompt=system_prompt)
 
-        result = booking_agent.invoke(state)
+        result = booking_agent.invoke({"messages": state["messages"]})
+        latest_message = (
+            result["messages"][-1].content
+            if isinstance(result, dict) and "messages" in result
+            else getattr(result, "content", str(result))
+        )
+
+        # Example: End if booking is confirmed
+        if "appointment confirmed" in latest_message.lower():
+            return Command(
+                update={"messages": state["messages"] + [AIMessage(content=latest_message, name="booking_node")]},
+                goto=END
+            )
 
         return Command(
-            update={
-                "messages": state["messages"] + [
-                    AIMessage(content=result["messages"][-1].content, name="booking_node")
-                    # HumanMessage(content=result["messages"][-1].content, name="booking_node")
-                ]
-            },
-            goto="supervisor",
+            update={"messages": state["messages"] + [AIMessage(content=latest_message, name="booking_node")]},
+            goto="supervisor"
         )
 
     def workflow(self):
